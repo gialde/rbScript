@@ -1,248 +1,254 @@
 """
-Скрипт автоматического движения по кругу для Roblox (ПК/Windows).
+Roblox: непрерывное движение по кругу через WASD.
 
-ВНИМАНИЕ: pydirectinput на Windows может требовать запуска скрипта
-от имени администратора для корректной инъекции ввода в некоторые процессы.
-Если ввод не доходит до игры — запустите терминал с правами администратора.
+Установка:
+    pip install pyrobloxbot keyboard
 
-Не используйте pyautogui в качестве замены — он не работает с Roblox,
-так как игра игнорирует стандартный SendInput без скан-кодов DirectInput.
+Управление:
+    F6      — старт/стоп
+    Esc     — выход
+    Ctrl+M  — failsafe pyrobloxbot
+
+ЧТО ДЕЛАЕТ:
+    Персонаж идёт по восьмиугольнику: W → W+D → D → S+D → S → S+A → A → W+A
+    и так по кругу, непрерывно. Каждая сторона держится LEG_DURATION секунд,
+    после каждой — пауза STEP_SETTLE_DELAY, чтобы персонаж успел остановиться
+    и не накапливал снос из-за инерции разворота.
+
+НАСТРОЙКА:
+    LEG_DURATION       — длина одной стороны (сек). Больше = крупнее круг.
+    STEP_SETTLE_DELAY  — пауза между сторонами (сек). Больше = меньше дрейфа.
+    SPRINT_ENABLED     — держать ли Shift (бег).
+    CLOCKWISE          — True по часовой, False против.
 """
 
 import sys
 import time
 import threading
 
-# --- Проверка и импорт зависимостей ---
 try:
-    import pydirectinput
+    import pyrobloxbot as bot
 except ImportError:
-    print("Ошибка: не найден модуль 'pydirectinput'.")
-    print("Выполните команду: pip install pydirectinput keyboard pygetwindow")
+    print("Ошибка: не найден 'pyrobloxbot'.")
+    print("Выполните: pip install pyrobloxbot")
     sys.exit(1)
 
 try:
     import keyboard
 except ImportError:
-    print("Ошибка: не найден модуль 'keyboard'.")
-    print("Выполните команду: pip install pydirectinput keyboard pygetwindow")
+    print("Ошибка: не найден 'keyboard'.")
+    print("Выполните: pip install keyboard")
     sys.exit(1)
 
-try:
-    import pygetwindow as gw
-except ImportError:
-    print("Ошибка: не найден модуль 'pygetwindow'.")
-    print("Выполните команду: pip install pydirectinput keyboard pygetwindow")
-    sys.exit(1)
 
 # =====================================================================
-# НАСТРОЙКИ (все значения можно менять вручную перед запуском скрипта)
+# НАСТРОЙКИ
 # =====================================================================
 
-LEG_DURATION = 1.5          # секунд идти прямо за один отрезок
-TURN_DEGREES = 90           # угол поворота
-TURN_METHOD = "mouse"       # "mouse" | "strafe"
-                            # "mouse" — физический поворот камеры мышью (персонаж вращается)
-                            # "strafe" — обход квадрата клавишами W→A→S→D без мыши
-                            #   (это НЕ поворот персонажа, а движение по квадратной траектории
-                            #    относительно текущей ориентации камеры)
-MOUSE_SENSITIVITY = 5.0     # пикселей мыши на 1 градус поворота (подбирается пользователем)
-FORWARD_KEY = "w"           # клавиша движения вперёд
-TOGGLE_KEY = "f6"           # горячая клавиша старт/стоп
-EXIT_KEY = "esc"            # горячая клавиша аварийного выхода
-ROBLOX_WINDOW_TITLE = "Roblox"  # подстрока в заголовке окна игры
-FOCUS_CHECK = True          # не отправлять ввод, если окно Roblox не в фокусе
-LOOP_DELAY = 0.05           # пауза между итерациями цикла (секунды)
+LEG_DURATION = 0.5           # длительность одной стороны восьмиугольника (сек)
+STEP_SETTLE_DELAY = 0.15     # пауза между сторонами (сек)
+CLOCKWISE = True             # True — по часовой, False — против
+SPRINT_ENABLED = False       # держать Shift во время движения (бег)
+SPRINT_KEY = "shift"
 
-# Количество шагов для плавного поворота мыши (чем больше, тем плавнее)
-MOUSE_TURN_STEPS = 20
+LOOP_DELAY = 0.05
 
-# Клавиши, которые скрипт использует и должен отпускать при очистке
-MANAGED_KEYS = ["w", "a", "s", "d"]
+TOGGLE_KEY = "f6"
+EXIT_KEY = "esc"
+
+bot.options.force_focus = True
+bot.options.action_cooldown = 0
+bot.options.key_press_cooldown = 0
+
 
 # =====================================================================
-# ГЛОБАЛЬНОЕ СОСТОЯНИЕ
+# ВОСЬМИУГОЛЬНИК
+# =====================================================================
+WASD_STEPS_CW = (
+    ("w",),
+    ("w", "d"),
+    ("d",),
+    ("s", "d"),
+    ("s",),
+    ("s", "a"),
+    ("a",),
+    ("w", "a"),
+)
+WASD_STEPS_CCW = tuple(reversed(WASD_STEPS_CW))
+
+
+# =====================================================================
+# СОСТОЯНИЕ
 # =====================================================================
 
 is_active = threading.Event()
+shutdown = threading.Event()
 toggle_lock = threading.Lock()
+sprint_is_down = False
 
 
-def is_roblox_focused():
-    """Проверяет, находится ли окно Roblox в фокусе."""
-    if not FOCUS_CHECK:
-        return True
-    try:
-        active_window = gw.getActiveWindow()
-        if active_window is None:
-            return False
-        return ROBLOX_WINDOW_TITLE.lower() in active_window.title.lower()
-    except Exception:
-        return False
-
+# =====================================================================
+# УПРАВЛЕНИЕ
+# =====================================================================
 
 def release_all_keys():
-    """Безусловно отпускает все управляемые клавиши."""
-    for key in MANAGED_KEYS:
+    global sprint_is_down
+    for k in ("w", "a", "s", "d"):
         try:
-            pydirectinput.keyUp(key)
+            bot.key_up(k)
         except Exception:
             pass
+    if sprint_is_down:
+        try:
+            bot.key_up(SPRINT_KEY)
+        except Exception:
+            pass
+        sprint_is_down = False
 
 
-def interruptible_sleep(duration):
-    """
-    Спит заданное время, но прерывается, если флаг is_active снят.
-    Возвращает True, если сон завершился полностью, False — если прерван.
-    """
-    end_time = time.monotonic() + duration
-    while time.monotonic() < end_time:
-        if not is_active.is_set():
+def sprint_on():
+    global sprint_is_down
+    if not SPRINT_ENABLED or sprint_is_down:
+        return
+    try:
+        bot.key_down(SPRINT_KEY)
+        sprint_is_down = True
+    except Exception as e:
+        print(f"Ошибка Shift: {e}")
+
+
+def interruptible_wait(duration):
+    end = time.monotonic() + duration
+    while time.monotonic() < end:
+        if not is_active.is_set() or shutdown.is_set():
             return False
-        time.sleep(min(LOOP_DELAY, max(0.0, end_time - time.monotonic())))
+        step = min(LOOP_DELAY, max(0.0, end - time.monotonic()))
+        if step > 0:
+            bot.wait(step)
     return True
 
 
-def turn_mouse():
-    """Поворот камеры мышью влево на TURN_DEGREES."""
-    total_pixels = int(TURN_DEGREES * MOUSE_SENSITIVITY)
-    step_pixels = max(1, total_pixels // MOUSE_TURN_STEPS)
-    remaining = total_pixels
+def do_step(keys, duration):
+    try:
+        bot.hold_keyboard_action(*keys, duration=duration)
+    except Exception as e:
+        print(f"Ошибка ввода: {e}")
+        return False
+    for k in keys:
+        try:
+            bot.key_up(k)
+        except Exception:
+            pass
+    return True
 
-    for _ in range(MOUSE_TURN_STEPS):
-        if not is_active.is_set():
+
+# =====================================================================
+# ОСНОВНОЙ ЦИКЛ
+# =====================================================================
+
+def circle_loop():
+    steps = WASD_STEPS_CW if CLOCKWISE else WASD_STEPS_CCW
+    direction_name = "по часовой" if CLOCKWISE else "против часовой"
+
+    while not shutdown.is_set():
+        is_active.wait(timeout=0.1)
+        if shutdown.is_set():
             return
-        move = min(step_pixels, remaining)
-        if move <= 0:
-            break
-        if is_roblox_focused():
-            pydirectinput.moveRel(-move, 0)
-        remaining -= move
-        time.sleep(0.01)
-
-    # Остаток, если деление было неточным
-    if remaining > 0 and is_active.is_set() and is_roblox_focused():
-        pydirectinput.moveRel(-remaining, 0)
-
-
-def turn_strafe():
-    """Обход квадрата через стрейф: A -> S -> D (W уже отработала в основном цикле)."""
-    strafe_sequence = ["a", "s", "d"]
-    for key in strafe_sequence:
         if not is_active.is_set():
-            return
-        if is_roblox_focused():
-            pydirectinput.keyDown(key)
-        completed = interruptible_sleep(LEG_DURATION)
-        if is_roblox_focused() or not completed:
-            pydirectinput.keyUp(key)
-        if not is_active.is_set():
-            return
+            continue
 
-
-def movement_loop():
-    """Основной цикл движения персонажа."""
-    while True:
-        # Ждём активации через F6
-        is_active.wait()
+        print(f"Ходьба запущена ({direction_name}). "
+              f"Сторона {LEG_DURATION}с, пауза {STEP_SETTLE_DELAY}с.")
 
         try:
-            while is_active.is_set():
-                # --- Шаг 1: Идём прямо ---
-                if is_roblox_focused():
-                    pydirectinput.keyDown(FORWARD_KEY)
+            while is_active.is_set() and not shutdown.is_set():
+                for step_keys in steps:
+                    if not is_active.is_set() or shutdown.is_set():
+                        break
 
-                completed = interruptible_sleep(LEG_DURATION)
+                    sprint_on()
 
-                if is_roblox_focused() or not completed:
-                    pydirectinput.keyUp(FORWARD_KEY)
+                    if not do_step(step_keys, LEG_DURATION):
+                        is_active.clear()
+                        break
 
-                if not is_active.is_set():
+                    if STEP_SETTLE_DELAY > 0:
+                        if not interruptible_wait(STEP_SETTLE_DELAY):
+                            break
+
+                if not is_active.is_set() or shutdown.is_set():
                     break
 
-                # --- Шаг 2: Поворот ---
-                if TURN_METHOD == "mouse":
-                    turn_mouse()
-                elif TURN_METHOD == "strafe":
-                    turn_strafe()
-                else:
-                    # Неизвестный метод — останавливаемся
-                    print(f"Ошибка: неизвестный TURN_METHOD '{TURN_METHOD}'. Допустимые значения: 'mouse', 'strafe'.")
-                    is_active.clear()
-                    break
-
-                if not is_active.is_set():
-                    break
-
-                # Короткая пауза между итерациями
-                interruptible_sleep(LOOP_DELAY)
+                interruptible_wait(LOOP_DELAY)
 
         finally:
-            # Гарантированно отпускаем все клавиши при остановке или ошибке
             release_all_keys()
 
 
+# =====================================================================
+# ХОТКЕИ
+# =====================================================================
+
 def on_toggle(event):
-    """Обработчик нажатия F6 — переключение старт/стоп."""
-    # Защита от дребезга: обрабатываем только нажатие (не отпускание)
-    if event.event_type == keyboard.KEY_DOWN:
-        with toggle_lock:
-            if is_active.is_set():
-                is_active.clear()
-                print("Ходьба: ВЫКЛ")
-            else:
-                is_active.set()
-                print("Ходьба: ВКЛ")
+    if event.event_type != keyboard.KEY_DOWN:
+        return
+    with toggle_lock:
+        if is_active.is_set():
+            is_active.clear()
+            release_all_keys()
+            print("Ходьба: ВЫКЛ")
+        else:
+            is_active.set()
+            print("Ходьба: ВКЛ")
 
 
 def on_exit(event):
-    """Обработчик нажатия Esc — аварийный выход."""
-    if event.event_type == keyboard.KEY_DOWN:
-        print("Аварийный выход...")
-        is_active.clear()
-        release_all_keys()
-        keyboard.unhook_all()
-        sys.exit(0)
+    if event.event_type != keyboard.KEY_DOWN:
+        return
+    print("Аварийный выход...")
+    is_active.clear()
+    release_all_keys()
+    shutdown.set()
 
 
-def validate_config():
-    """Проверка корректности конфигурации при старте."""
-    if TURN_METHOD not in ("mouse", "strafe"):
-        print(f"Ошибка: недопустимое значение TURN_METHOD = '{TURN_METHOD}'.")
-        print("Допустимые значения: 'mouse' или 'strafe'. Исправьте константу в начале файла.")
-        sys.exit(1)
-
+# =====================================================================
+# ТОЧКА ВХОДА
+# =====================================================================
 
 def main():
-    """Точка входа."""
-    validate_config()
+    print("=" * 60)
+    print("Roblox: непрерывное движение по кругу через WASD")
+    print("F6 — старт/стоп, Esc — выход, Ctrl+M — failsafe")
+    print("=" * 60)
+    print(f"Направление: {'по часовой' if CLOCKWISE else 'против часовой'}")
+    print(f"Сторона: {LEG_DURATION} сек × 8 сторон")
+    print(f"Пауза между сторонами: {STEP_SETTLE_DELAY} сек")
+    circle_time = 8 * (LEG_DURATION + STEP_SETTLE_DELAY)
+    print(f"Полный круг: ~{circle_time:.2f} сек")
+    print(f"Спринт (Shift): {'ВКЛ' if SPRINT_ENABLED else 'ВЫКЛ'}")
+    print("=" * 60)
 
-    print("=" * 45)
-    print("Скрипт движения по кругу для Roblox запущен.")
-    print("F6 — старт/стоп, Esc — выход")
-    print(f"Режим поворота: {TURN_METHOD}")
-    if TURN_METHOD == "mouse":
-        print(f"Чувствительность мыши: {MOUSE_SENSITIVITY} px/градус")
-    print("=" * 45)
-
-    # Регистрируем глобальные хоткеи
     keyboard.hook_key(TOGGLE_KEY, on_toggle, suppress=True)
     keyboard.hook_key(EXIT_KEY, on_exit, suppress=True)
 
-    # Запускаем поток движения
-    loop_thread = threading.Thread(target=movement_loop, daemon=True)
-    loop_thread.start()
+    t = threading.Thread(target=circle_loop, daemon=True)
+    t.start()
 
-    # Основной поток ждёт, чтобы хуки keyboard продолжали работать
     try:
-        while True:
-            time.sleep(1)
+        while not shutdown.is_set():
+            time.sleep(0.1)
     except KeyboardInterrupt:
-        print("\nПринудительное завершение (Ctrl+C)...")
+        print("\nCtrl+C...")
+    finally:
         is_active.clear()
         release_all_keys()
-        keyboard.unhook_all()
-        sys.exit(0)
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+
+    print("Завершено.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
