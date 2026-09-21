@@ -1,6 +1,10 @@
 # rbScript
 Установка:
     pip install pyrobloxbot keyboard
+    pip install mss opencv-python numpy
+    и надо накотить питон если нет
+Запуск:
+    python main.py вписывать в павершел
 
 Управление:
     F6      — старт/стоп
